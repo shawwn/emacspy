@@ -224,6 +224,28 @@ cdef class EmacsValue:
     def __ge__(self, other):
         return F['>='](self, other).t()
 
+    def __len__(self):
+        return F['length'](self).int()
+
+    def __iter__(self):
+        return iter(EmacsValueIterator(self))
+
+
+class EmacsValueIterator:
+    def __init__(self, value):
+        self.value = value
+        self.index = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.index >= len(self.value):
+            raise StopIteration
+        ret = self.value[self.index]
+        self.index += 1
+        return ret
+
 
 cdef emacs_value unwrap(obj) except *:
     if obj is None:
