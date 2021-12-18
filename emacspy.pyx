@@ -119,6 +119,20 @@ cdef emacs_env* get_env() except *:
 cdef class _ForDealloc:
     cdef emacs_value v
 
+cdef c_str(emacs_value v):
+    cdef emacs_env* env = get_env()
+    cdef ptrdiff_t size = -1
+    env.copy_string_contents(env, v, NULL, &size)
+    cdef char* buf = <char*>malloc(size)
+    if not env.copy_string_contents(env, v, buf, &size):
+        raise TypeError('value is not a string')
+    assert size > 0
+    return buf[:size - 1].decode('utf8')
+
+cdef c_sym_str(emacs_value v):
+    p = EmacsValue.wrap(v)
+    return _F().symbol_name(p).str()
+
 cdef class EmacsValue:
     cdef emacs_value v
 
@@ -138,20 +152,35 @@ cdef class EmacsValue:
             current_env.free_global_ref(current_env, self.v)
             self.v = NULL
 
-    cpdef str(self):
+    cdef emacs_value type_of(self):
         cdef emacs_env* env = get_env()
-        cdef ptrdiff_t size = -1
-        env.copy_string_contents(env, self.v, NULL, &size)
-        cdef char* buf = <char*>malloc(size)
-        if not env.copy_string_contents(env, self.v, buf, &size):
-            raise TypeError('value is not a string')
-        assert size > 0
-        return buf[:size - 1].decode('utf8')
+        return env.type_of(env, self.v)
+
+    cpdef type(self):
+        return c_sym_str(self.type_of())
+
+    def check(self, kind):
+        isa = self.type()
+        if isa != kind:
+            raise TypeError(f'value is a {isa}, not a {kind}')
+        
+    cpdef str(self):
+        return c_str(self.v)
 
     cpdef int int(self) except *:
+        self.check('integer')
         cdef emacs_env* env = get_env()
         cdef intmax_t i = env.extract_integer(env, self.v)
         return i
+
+    cpdef double float(self) except *:
+        self.check('float')
+        cdef emacs_env* env = get_env()
+        cdef double f = env.extract_float(env, self.v)
+        return f
+
+    cpdef bool t(self) except *:
+        return str(self) != 'nil'
 
     def sym_str(self):
         return _F().symbol_name(self).str()
@@ -159,13 +188,58 @@ cdef class EmacsValue:
     def __str__(self):
         return _F().prin1_to_string(self).str()
 
+    def __repr__(self):
+        return f'{self}'
+
+    def __getitem__(self, index):
+        return _F().elt(self, index)
+
+    def __int__(self):
+        return self.int()
+
+    def __float__(self):
+        return self.float()
+
+    def __bool__(self):
+        return self.t()
+
+    def __eq__(self, other):
+        if self.type() == 'string':
+            return F['string='](self, other).t()
+        else:
+            return F.eql(self, other).t()
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __lt__(self, other):
+        return F['<'](self, other).t()
+
+    def __gt__(self, other):
+        return F['>'](self, other).t()
+
+    def __le__(self, other):
+        return F['<='](self, other).t()
+
+    def __ge__(self, other):
+        return F['>='](self, other).t()
+
+
 cdef emacs_value unwrap(obj) except *:
-    if isinstance(obj, str):
+    if obj is None:
+        obj = nil
+    elif obj is False:
+        obj = nil
+    elif obj is True:
+        obj = t
+    elif isinstance(obj, str):
         obj = string(obj)
     elif isinstance(obj, int):
         obj = make_int(obj)
-    elif obj is None:
-        obj = nil
+    elif isinstance(obj, float):
+        obj = make_float(obj)
+    elif isinstance(obj, list):
+        obj = funcall(sym('list'), obj)
 
     if isinstance(obj, EmacsValue):
         return (<EmacsValue>obj).v
@@ -188,6 +262,10 @@ cpdef string(str s):
 cpdef make_int(int i):
     cdef emacs_env* env = get_env()
     return EmacsValue.wrap(env.make_integer(env, i))
+
+cpdef make_float(double f):
+    cdef emacs_env* env = get_env()
+    return EmacsValue.wrap(env.make_float(env, f))
 
 cdef emacs_value string_ptr(str s):
     cdef emacs_env* env = get_env()
@@ -280,21 +358,24 @@ def init():
     _F().define_error(sym('python-exception'), "Python error")
 
 cdef public int emacs_module_init_py(emacs_runtime* runtime):
-    global current_env, nil
+    global current_env, nil, t
     cdef emacs_env* prev_env = current_env
 
     current_env = runtime.get_environment(runtime)
     nil = _V().nil
+    t = _V().t
     init()
     current_env = prev_env
     return 0
 
 class _F:
-    def __getattr__(self, name):
-        name = name.replace('_', '-')
+    def __getattr__(self, fname):
+        name = fname.replace('_', '-')
 
         def f(*args):
             return funcall(sym(name), args)
+
+        f.__name__ = f.__qualname__ = fname
 
         return f
 
@@ -302,7 +383,7 @@ class _F:
         return getattr(self, name)
 
 # for calling Emacs functions
-f = _F()
+F = _F()
 
 def defun(name, docstring=""):
     def wrapper(f):
@@ -314,11 +395,11 @@ def defun(name, docstring=""):
 class _V:
     def __getattr__(self, name):
         name = name.replace('_', '-')
-        return f.symbol_value(sym(name))
+        return F.symbol_value(sym(name))
 
     def __setattr__(self, name, value):
         name = name.replace('_', '-')
-        f.set(sym(name), value)
+        F.set(sym(name), value)
 
     def __getitem__(self, name):
         return getattr(self, name)
@@ -327,4 +408,26 @@ class _V:
         setattr(self, name, value)
 
 # for accessing Emacs variables
-v = _V()
+V = _V()
+
+class _Q:
+    def __getattr__(self, name):
+        name = name.replace('_', '-')
+        return sym(name)
+
+    def __getitem__(self, name):
+        return sym(name)
+
+# for making symbols
+Q = _Q()
+
+# for making lists
+L = F.list
+
+# read from a string
+def S(string):
+  return F.car(F.read_from_string(string))
+
+# eval a string
+def E(string):
+  return F.eval(S(string))
